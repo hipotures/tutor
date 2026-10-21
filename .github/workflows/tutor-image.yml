@@ -1,0 +1,61 @@
+name: Tutor image
+
+# Publishes the fork's Alpine image for HomeStack, e.g. tag tutor-0.1.0
+# publishes ghcr.io/hipotures/tutor:0.1.0. The tag prefix keeps fork releases
+# apart from upstream Vaultwarden tags (1.x.y) fetched into the fork.
+
+on:
+  push:
+    tags: ['tutor-[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Image tag
+        id: tag
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [[ "$REF_TYPE" == tag ]]; then
+            [[ "$REF_NAME" =~ ^tutor-((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$ ]]
+            echo "tag=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=dev-${SHA::12}" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # docker/Dockerfile.alpine builds a static musl binary and adds the
+      # web vault. Only SQLite is built: HomeStack runs a single instance.
+      - uses: docker/build-push-action@v6.18.0
+        with:
+          context: .
+          file: docker/Dockerfile.alpine
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            DB=sqlite,enable_mimalloc
+            VW_VERSION=tutor-${{ steps.tag.outputs.tag }}
+          cache-from: type=gha,scope=tutor-image
+          cache-to: type=gha,scope=tutor-image,mode=max
+          tags: ghcr.io/hipotures/tutor:${{ steps.tag.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.tag.outputs.tag }}
+            org.opencontainers.image.revision=${{ github.sha }}
