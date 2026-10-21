@@ -21,9 +21,9 @@ use crate::{
     db::{
         DbConn, DbPool,
         models::{
-            Archive, Attachment, AttachmentId, Cipher, CipherId, Collection, CollectionCipher, CollectionGroup,
-            CollectionId, CollectionUser, EventType, Favorite, Folder, FolderCipher, FolderId, Group, KeyId,
-            Membership, MembershipType, OrgPolicy, OrgPolicyType, OrganizationId, RepromptType, Send, UserId,
+            API_KEY_CIPHER_TYPE, Archive, Attachment, AttachmentId, Cipher, CipherId, Collection, CollectionCipher,
+            CollectionGroup, CollectionId, CollectionUser, EventType, Favorite, Folder, FolderCipher, FolderId, Group,
+            KeyId, Membership, MembershipType, OrgPolicy, OrgPolicyType, OrganizationId, RepromptType, Send, UserId,
         },
     },
     util::{NumberOrString, deser_opt_nonempty_str, save_temp_file},
@@ -136,6 +136,7 @@ async fn sync(data: SyncData, headers: Headers, client_version: Option<ClientVer
     if !show_ssh_keys {
         ciphers.retain(|c| c.atype != 5);
     }
+    ciphers.retain(Cipher::is_visible_type);
 
     let cipher_sync_data = CipherSyncData::new(&headers.user.uuid, CipherSyncType::User, &conn).await;
 
@@ -214,7 +215,8 @@ async fn sync(data: SyncData, headers: Headers, client_version: Option<ClientVer
 
 #[get("/ciphers")]
 async fn get_ciphers(headers: Headers, conn: DbConn) -> JsonResult {
-    let ciphers = Cipher::find_by_user_visible(&headers.user.uuid, &conn).await;
+    let mut ciphers = Cipher::find_by_user_visible(&headers.user.uuid, &conn).await;
+    ciphers.retain(Cipher::is_visible_type);
     let cipher_sync_data = CipherSyncData::new(&headers.user.uuid, CipherSyncType::User, &conn).await;
 
     let mut ciphers_json = Vec::with_capacity(ciphers.len());
@@ -282,6 +284,7 @@ pub struct CipherData {
     BankAccount = 6
     DriversLicense = 7
     Passport = 8
+    ApiKey = 100 (fork-specific)
     */
     pub r#type: i32,
     pub name: String,
@@ -297,6 +300,7 @@ pub struct CipherData {
     bank_account: Option<Value>,
     drivers_license: Option<Value>,
     passport: Option<Value>,
+    api_key: Option<Value>,
 
     favorite: Option<bool>,
     reprompt: Option<i32>,
@@ -548,6 +552,7 @@ pub async fn update_cipher_from_data(
         6 => data.bank_account,
         7 => data.drivers_license,
         8 => data.passport,
+        API_KEY_CIPHER_TYPE if Cipher::api_key_type_enabled() => data.api_key,
         _ => err!("Invalid type"),
     };
 

@@ -855,7 +855,8 @@ async fn get_org_details_impl(
     user_id: &UserId,
     conn: &DbConn,
 ) -> Result<Value, crate::Error> {
-    let ciphers = Cipher::find_by_org(org_id, conn).await;
+    let mut ciphers = Cipher::find_by_org(org_id, conn).await;
+    ciphers.retain(Cipher::is_visible_type);
     let cipher_sync_data = CipherSyncData::new(user_id, CipherSyncType::Organization, conn).await;
 
     let mut ciphers_json = Vec::with_capacity(ciphers.len());

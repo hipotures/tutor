@@ -1441,6 +1441,8 @@ pub const SUPPORTED_FEATURE_FLAGS: &[&str] = &[
     "pm-30529-webauthn-related-origins",
     // Vault Team
     "pm-32009-new-item-types",
+    // Fork specific
+    "vw-api-key-item-type",
 ];
 
 impl Config {

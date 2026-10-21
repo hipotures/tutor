@@ -28,6 +28,13 @@ use super::{
     MembershipStatus, MembershipType, OrganizationId, User, UserId,
 };
 
+/// Fork-specific API key item type.
+/// Uses a high number to avoid clashing with item types added upstream in the future.
+pub const API_KEY_CIPHER_TYPE: i32 = 100;
+/// Client feature flag which enables the API key item type.
+/// Official clients do not know this type, so it is hidden from them unless the flag is enabled.
+pub const API_KEY_FEATURE_FLAG: &str = "vw-api-key-item-type";
+
 #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
 #[diesel(table_name = ciphers)]
 #[diesel(treat_none_as_null = true)]
@@ -51,6 +58,7 @@ pub struct Cipher {
     // BankAccount = 6,
     // DriversLicense = 7,
     // Passport = 8,
+    // ApiKey = 100 (fork-specific, see API_KEY_CIPHER_TYPE)
     pub atype: i32,
     pub name: String,
     pub notes: Option<String>,
@@ -70,6 +78,15 @@ pub enum RepromptType {
 
 /// Local methods
 impl Cipher {
+    pub fn api_key_type_enabled() -> bool {
+        CONFIG.experimental_client_feature_flags().split(',').any(|flag| flag.trim() == API_KEY_FEATURE_FLAG)
+    }
+
+    /// Returns false for item types the clients should not receive, because they are not enabled
+    pub fn is_visible_type(&self) -> bool {
+        self.atype != API_KEY_CIPHER_TYPE || Self::api_key_type_enabled()
+    }
+
     pub fn new(atype: i32, name: String) -> Self {
         let now = Utc::now().naive_utc();
 
@@ -400,6 +417,7 @@ impl Cipher {
             6 => "bankAccount",
             7 => "driversLicense",
             8 => "passport",
+            API_KEY_CIPHER_TYPE => "apiKey",
             _ => err!(format!("Cipher {} has an invalid type {}", self.uuid, self.atype)),
         };
 
