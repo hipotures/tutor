@@ -313,6 +313,8 @@ debug = "full"
 [profile.dev]
 split-debuginfo = "unpacked"
 debug = "line-tables-only"
+# The incremental cache grows by gigabytes across feature sets; see scripts/cargo.py
+incremental = false
 
 # Used for CI builds to improve compile time
 [profile.ci]
