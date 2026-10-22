@@ -55,6 +55,7 @@ mod config;
 mod crypto;
 #[macro_use]
 mod db;
+mod homestack_status;
 mod http_client;
 mod mail;
 mod ratelimit;
@@ -593,7 +594,7 @@ async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error>
         .register([basepath, "/api"].concat(), api::core_catchers())
         .register([basepath, "/admin"].concat(), api::admin_catchers())
         .manage(pool)
-        .manage(hs_service_status::Sampler::start()?)
+        .manage(homestack_status::Sampler::start()?)
         .manage(Arc::clone(&WS_USERS))
         .manage(Arc::clone(&WS_ANONYMOUS_SUBSCRIPTIONS))
         .attach(util::AppHeaders())

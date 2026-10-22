@@ -293,13 +293,16 @@ pub fn homestack_status_routes() -> Vec<Route> {
 
 #[derive(Responder)]
 #[response(content_type = "json")]
-struct HomestackStatus(Json<hs_service_status::Report>, Header<'static>);
+struct HomestackStatus(Json<crate::homestack_status::Report>, Header<'static>);
 
 // Answers from the sampler's cached measurements; never blocks on filesystem I/O.
 // Reaching this handler means the process is live, hence always "pass".
 #[get("/.well-known/homestack/status")]
-fn homestack_status(sampler: &State<hs_service_status::Sampler>) -> HomestackStatus {
-    HomestackStatus(Json(sampler.report(hs_service_status::Status::Pass)), Header::new("Cache-Control", "no-store"))
+fn homestack_status(sampler: &State<crate::homestack_status::Sampler>) -> HomestackStatus {
+    HomestackStatus(
+        Json(sampler.report(crate::homestack_status::Status::Pass)),
+        Header::new("Cache-Control", "no-store"),
+    )
 }
 
 // This endpoint/function is used during development and development only.

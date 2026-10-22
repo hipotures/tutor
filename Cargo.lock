@@ -2404,15 +2404,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hs-service-status"
-version = "0.1.0"
-source = "git+https://github.com/hipotures/homestack?rev=69dacecf992436bf5fa8e2d7b9d3c3cf04c0bf0d#69dacecf992436bf5fa8e2d7b9d3c3cf04c0bf0d"
-dependencies = [
- "rustix",
- "serde",
-]
-
-[[package]]
 name = "html5gum"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5965,7 +5956,6 @@ dependencies = [
  "grass_compiler",
  "handlebars",
  "hickory-resolver",
- "hs-service-status",
  "html5gum",
  "http 1.5.0",
  "ipnet",
@@ -5997,6 +5987,7 @@ dependencies = [
  "rocket",
  "rocket_ws",
  "rpassword",
+ "rustix",
  "rustls 0.23.45",
  "semver",
  "serde",
