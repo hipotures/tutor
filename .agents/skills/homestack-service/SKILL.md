@@ -53,7 +53,8 @@ contract is in [manifest-schema.md](manifest-schema.md); follow it literally.
    `multi_node: false` and `state_model: local`. A health check must be real:
    use HTTP only if the service serves that path; otherwise `tcp` or none.
    An HTTP service exposes the standard health endpoints below and the
-   manifest points at its readiness endpoint.
+   manifest points at its readiness endpoint. It also implements the
+   [service telemetry contract](service-status.md) on that same HTTP port.
 7. Verify without touching any cluster: the YAML parses and satisfies the
    schema; the service starts with an empty `/home/app`, writes its state
    there, and keeps it across a restart.
@@ -77,6 +78,32 @@ APIs" (draft-inadarei-api-health-check), never as free text:
 The manifest's `runtime.healthcheck` uses `/health/ready` with
 `expected_status: 200`. Keep pre-existing health URLs working if something
 else depends on them.
+
+## Service telemetry
+
+HTTP services implement `GET /.well-known/homestack/status`, returning
+`application/json` according to [service-status.md](service-status.md). Read
+that contract when implementing or reviewing the endpoint. It is independent
+of the application's language and separate from health/readiness. Use the
+existing HTTP server and native OS APIs; no additional daemon, SSH, shell
+commands or framework replacement. Keep schema 1 YAML unchanged: the endpoint
+uses the HTTP healthcheck's declared port, with a fixed path.
+
+Report process uptime, explicitly scoped system load (1/5/15 minutes), and
+an array of actual data mounts including `/` and `/home/app`, with filesystem
+type and byte capacities. Detect mounts instead of assuming ext4: XFS, Btrfs,
+NFS and other supported filesystems use the same contract. Missing mounts,
+failed measurements and stale data must remain distinguishable from zero
+free space. These observations never prove Proxmox volume ownership and
+never authorize a lifecycle operation.
+
+The HomeStack repository contains a small Linux Rust implementation in
+`crates/hs-service-status`; reuse it when available. For other languages,
+implement the same wire contract with native equivalents. Do not require
+Rust, publish a new package, or add an HTTP listener to a non-HTTP service
+merely because this reference exists. Verify with local HTTP requests and
+compare filesystem values with `df -B1` or the platform equivalent; also
+check an absent `/home/app` and a measurement failure without touching PVE.
 
 ## Release standard
 
