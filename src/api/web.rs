@@ -4,9 +4,9 @@ use std::{
 };
 
 use rocket::{
-    Catcher, Route,
+    Catcher, Route, State,
     fs::NamedFile,
-    http::ContentType,
+    http::{ContentType, Status},
     response::{Redirect, content::RawCss as Css, content::RawHtml as Html},
     serde::json::Json,
 };
@@ -18,7 +18,7 @@ use crate::{
     auth::decode_file_download,
     crypto::sha256_hex,
     db::{
-        DbConn,
+        DbConn, DbPool,
         models::{AttachmentId, CipherId},
     },
     error::Error,
@@ -28,7 +28,7 @@ use crate::{
 pub fn routes() -> Vec<Route> {
     // If adding more routes here, consider also adding them to
     // crate::utils::LOGGED_ROUTES to make sure they appear in the log
-    let mut routes = routes![attachments, alive, alive_head, static_files];
+    let mut routes = routes![attachments, alive, alive_head, health_live, health_ready, static_files];
     if CONFIG.web_vault_enabled() {
         routes.append(&mut routes![
             web_index,
@@ -251,6 +251,38 @@ fn alive_head(_conn: DbConn) -> EmptyResult {
     // Avoid logging spurious "No matching routes for HEAD /alive" errors
     // due to <https://github.com/SergioBenitez/Rocket/issues/1098>.
     Ok(())
+}
+
+// Health checks in the "Health Check Response Format for HTTP APIs" draft
+// (https://datatracker.ietf.org/doc/html/draft-inadarei-api-health-check):
+// `application/health+json`, `status` "pass" or "fail", 200 or 503.
+type HealthResponse = (Status, (ContentType, Json<Value>));
+
+fn health(pass: bool, checks: Option<Value>) -> HealthResponse {
+    let mut body = json!({ "status": if pass { "pass" } else { "fail" } });
+    if let Some(checks) = checks {
+        body["checks"] = checks;
+    }
+    let status = if pass {
+        Status::Ok
+    } else {
+        Status::ServiceUnavailable
+    };
+    (status, (ContentType::new("application", "health+json"), Json(body)))
+}
+
+// Liveness: the server answers requests; no dependencies are checked.
+#[get("/health/live")]
+fn health_live() -> HealthResponse {
+    health(true, None)
+}
+
+// Readiness: the server can serve the vault, i.e. it gets a database connection.
+#[get("/health/ready")]
+async fn health_ready(pool: &State<DbPool>) -> HealthResponse {
+    let database = pool.get().await.is_ok();
+    let check = json!([{ "status": if database { "pass" } else { "fail" } }]);
+    health(database, Some(json!({ "database:connection": check })))
 }
 
 // This endpoint/function is used during development and development only.

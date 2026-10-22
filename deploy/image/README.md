@@ -28,7 +28,7 @@ credentials.
 | :--- | :--- |
 | Entrypoint | `/entrypoint.sh`, which prepares `/home/app` and runs `/start.sh` → `/vaultwarden` |
 | Port | `80/tcp` (`web`), plain HTTP |
-| Health | `GET /alive` → `200`; it also checks the database connection |
+| Health | `GET /health/ready` → `200` `{"status":"pass",…}` when the database is reachable, `503` `"fail"` otherwise; `GET /health/live` → `200` `{"status":"pass"}` without checking dependencies. Both `application/health+json`. The upstream `/alive` (a bare timestamp string) stays for the Docker healthcheck |
 | Persistent volume | `/home/app`, mounted by HomeStack before the first start |
 | State | `/home/app/data` (`DATA_FOLDER`): `db.sqlite3` with its `-wal`/`-shm` files, `rsa_key.pem`, `config.json`, `attachments/`, `sends/`, `icon_cache/`, `tmp/` |
 | Logs | stdout/stderr |
