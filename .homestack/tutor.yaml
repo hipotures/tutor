@@ -1,0 +1,26 @@
+schema: 1
+id: tutor
+name: Tutor
+
+image:
+  repository: ghcr.io/hipotures/tutor
+
+runtime:
+  ports:
+    - name: web
+      port: 80
+      protocol: tcp
+  healthcheck:
+    type: http
+    port: web
+    path: /alive
+    expected_status: 200
+
+persistence:
+  mount: /home/app
+  directories:
+    - data
+
+deployment:
+  multi_node: false
+  state_model: local
