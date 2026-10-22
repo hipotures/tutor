@@ -48,10 +48,12 @@ it as such, not as an application-level healthy result.
 
 ## Image versions
 
-`image.repository` carries no version. HomeStack lists the repository's tags,
+`image.repository` carries no version. HomeStack lists the image's tags,
 offers the release tags (`MAJOR.MINOR.PATCH`, no prefix) to the operator, and
-records the resolved digest of the chosen one. Other tags are not releases.
-The image must be pullable anonymously by the Proxmox node (a public package).
+records the resolved digest of the chosen one. Other tags (e.g. `dev-<commit>`)
+are not releases. Published release tags are immutable. The image must be
+pullable anonymously by the Proxmox node (a public package). The Git tag that
+produced release `X.Y.Z` is `<id>-X.Y.Z`.
 
 ## What never goes in a manifest
 

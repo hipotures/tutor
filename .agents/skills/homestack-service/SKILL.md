@@ -45,10 +45,8 @@ contract is in [manifest-schema.md](manifest-schema.md); follow it literally.
    - do not declare `VOLUME` and do not mount anything in the image;
    - the LXC is unprivileged: run as container root or a fixed service user
      that owns its directories; never fix permissions with world-writable modes.
-5. Keep the existing build and release process when it works. The published
-   image must be single `linux/amd64`, pullable anonymously by the Proxmox
-   node, and released under plain `MAJOR.MINOR.PATCH` tags. Do not create
-   release tags unless the repository's own instructions say so.
+5. Set up image releases to the standard below; it is required, not optional.
+   Adapt a working build to it rather than replacing it wholesale.
 6. Write `.homestack/<id>.yaml` per the schema. `multi_node: true` only when
    independent simultaneous instances are genuinely safe (`stateless`, or
    `external` shared state designed for it). Local SQLite means
@@ -59,6 +57,38 @@ contract is in [manifest-schema.md](manifest-schema.md); follow it literally.
    there, and keeps it across a restart.
 8. Document the service's runtime contract next to its image, including the
    settings HomeStack must provide at deployment time (never their values).
+
+## Release standard
+
+Every service has its own independent SemVer version line:
+
+1. **Tags.** A release is the annotated Git tag `<id>-MAJOR.MINOR.PATCH`
+   (`<id>` is the manifest `id`, e.g. `tutor-0.1.2`). The prefix keeps several
+   services in one repository, and upstream tags in forks, apart.
+2. **Automatic numbering.** The repository has a tagging script (create it if
+   missing, e.g. `scripts/tag-image.py`) that fetches tags, takes the highest
+   `<id>-X.Y.Z`, creates the next patch version on a clean HEAD that is
+   already pushed to its upstream, and pushes only that tag. It refuses a dirty
+   tree, an unpushed HEAD and a HEAD that is already released, and has a
+   `--dry-run`. Never pick version numbers by hand; bump minor or major only
+   when the owner asks.
+3. **Release build.** CI builds the image when such a tag is pushed and
+   publishes `<registry>/<image>:MAJOR.MINOR.PATCH` (no prefix, no `v`) as a
+   single `linux/amd64` image, pullable anonymously by the Proxmox node.
+4. **Development build.** A manual CI run publishes `dev-<commit>` for testing,
+   without a new version.
+5. **Ordinary pushes** run checks only and never publish an image.
+6. **Immutability.** Never move, delete or force-push release tags, and never
+   overwrite a published version: CI refuses to publish a version that already
+   exists. A bad release is fixed by the next patch release.
+
+Not every change is a release. After committing and pushing a completed
+change, decide whether the running service changes: application code or
+dependencies it uses, the Containerfile, entrypoint or runtime files, or
+`image`/`runtime`/`persistence` in the manifest. If so, run the tagging script;
+if the change only touches documentation, tests, CI checks or tooling, do not.
+Record this rule in the repository's agent instructions (`AGENTS.md`) so
+agents working without this skill follow it too.
 
 ## Refuse
 

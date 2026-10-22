@@ -8,12 +8,19 @@ manifest schema is
 
 ## Releases
 
-Pushing a Git tag `tutor-X.Y.Z` runs `.github/workflows/tutor-image.yml`,
-which builds [`Containerfile`](Containerfile) for `linux/amd64` and publishes
-`ghcr.io/hipotures/tutor:X.Y.Z`. The `tutor-` prefix keeps fork releases apart
-from upstream Vaultwarden tags. Only `X.Y.Z` image tags are releases; a manual
-workflow run publishes `dev-<commit>` images for testing. The package is
-public, so a Proxmox node pulls it without credentials.
+`python3 scripts/tag-image.py` tags the clean, already pushed HEAD as the next
+patch version `tutor-X.Y.Z` and pushes the tag (`--dry-run` only prints it).
+The tag runs `.github/workflows/tutor-image.yml`, which builds
+[`Containerfile`](Containerfile) for `linux/amd64` and publishes
+`ghcr.io/hipotures/tutor:X.Y.Z`; it refuses to overwrite a version that is
+already published. The `tutor-` prefix keeps fork releases apart from upstream
+Vaultwarden tags. Only `X.Y.Z` image tags are releases; a manual workflow run
+publishes `dev-<commit>` images for testing, and ordinary pushes publish
+nothing. The package is public, so a Proxmox node pulls it without
+credentials.
+
+`tutor-0.1.0` has no image (its build was cancelled) and `0.1.1` predates the
+`/home/app/data` layout; use later releases.
 
 ## Runtime contract
 
