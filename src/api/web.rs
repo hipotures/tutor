@@ -6,7 +6,7 @@ use std::{
 use rocket::{
     Catcher, Route, State,
     fs::NamedFile,
-    http::{ContentType, Status},
+    http::{ContentType, Header, Status},
     response::{Redirect, content::RawCss as Css, content::RawHtml as Html},
     serde::json::Json,
 };
@@ -283,6 +283,23 @@ async fn health_ready(pool: &State<DbPool>) -> HealthResponse {
     let database = pool.get().await.is_ok();
     let check = json!([{ "status": if database { "pass" } else { "fail" } }]);
     health(database, Some(json!({ "database:connection": check })))
+}
+
+// HomeStack service telemetry, see .agents/skills/homestack-service/service-status.md.
+// Mounted at "/" regardless of the DOMAIN base path, since HomeStack uses a fixed path.
+pub fn homestack_status_routes() -> Vec<Route> {
+    routes![homestack_status]
+}
+
+#[derive(Responder)]
+#[response(content_type = "json")]
+struct HomestackStatus(Json<hs_service_status::Report>, Header<'static>);
+
+// Answers from the sampler's cached measurements; never blocks on filesystem I/O.
+// Reaching this handler means the process is live, hence always "pass".
+#[get("/.well-known/homestack/status")]
+fn homestack_status(sampler: &State<hs_service_status::Sampler>) -> HomestackStatus {
+    HomestackStatus(Json(sampler.report(hs_service_status::Status::Pass)), Header::new("Cache-Control", "no-store"))
 }
 
 // This endpoint/function is used during development and development only.

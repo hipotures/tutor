@@ -581,6 +581,8 @@ async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error>
     // crate::utils::LOGGED_ROUTES to make sure they appear in the log
     let instance = rocket::custom(config)
         .mount([basepath, "/"].concat(), api::web_routes())
+        // A fixed path for HomeStack, independent of the DOMAIN base path
+        .mount("/", api::homestack_status_routes())
         .mount([basepath, "/api"].concat(), api::core_routes())
         .mount([basepath, "/admin"].concat(), api::admin_routes())
         .mount([basepath, "/events"].concat(), api::core_events_routes())
@@ -591,6 +593,7 @@ async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error>
         .register([basepath, "/api"].concat(), api::core_catchers())
         .register([basepath, "/admin"].concat(), api::admin_catchers())
         .manage(pool)
+        .manage(hs_service_status::Sampler::start()?)
         .manage(Arc::clone(&WS_USERS))
         .manage(Arc::clone(&WS_ANONYMOUS_SUBSCRIPTIONS))
         .attach(util::AppHeaders())

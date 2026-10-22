@@ -65,6 +65,10 @@ syslog = "7.0.0"
 [dependencies]
 macros = { path = "./macros" }
 
+# HomeStack service telemetry (GET /.well-known/homestack/status), the reference implementation of
+# .agents/skills/homestack-service/service-status.md
+hs-service-status = { git = "https://github.com/hipotures/homestack", rev = "69dacecf992436bf5fa8e2d7b9d3c3cf04c0bf0d" }
+
 # Logging
 log = "0.4.34"
 fern = { version = "0.7.1", features = ["syslog-7", "reopen-1"] }

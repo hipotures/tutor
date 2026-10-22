@@ -29,6 +29,7 @@ credentials.
 | Entrypoint | `/entrypoint.sh`, which prepares `/home/app` and runs `/start.sh` → `/vaultwarden` |
 | Port | `80/tcp` (`web`), plain HTTP |
 | Health | `GET /health/ready` → `200` `{"status":"pass",…}` when the database is reachable, `503` `"fail"` otherwise; `GET /health/live` → `200` `{"status":"pass"}` without checking dependencies. Both `application/health+json`. The upstream `/alive` (a bare timestamp string) stays for the Docker healthcheck |
+| Telemetry | `GET /.well-known/homestack/status` on port 80 (always at the root, regardless of the `DOMAIN` path): uptime, load and mount capacities per the skill's `service-status.md`, via the `hs-service-status` crate from HomeStack. For the management network only: a public proxy must not route this path |
 | Persistent volume | `/home/app`, mounted by HomeStack before the first start |
 | State | `/home/app/data` (`DATA_FOLDER`): `db.sqlite3` with its `-wal`/`-shm` files, `rsa_key.pem`, `config.json`, `attachments/`, `sends/`, `icon_cache/`, `tmp/` |
 | Logs | stdout/stderr |
