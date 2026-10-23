@@ -21,6 +21,8 @@ runtime:
     port: web
     path: /health/ready
     expected_status: 200
+    # Requires heartbeat support in the runtime; implementation is pending.
+    heartbeat_seconds: 60
 
 persistence:
   mount: /home/app
@@ -30,6 +32,7 @@ persistence:
     - data
 
 deployment:
+  hostname: tutor
   instances: 1
   placement: single
   state_model: local
