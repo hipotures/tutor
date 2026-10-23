@@ -1,0 +1,102 @@
+diff --git a/apps/web/src/app/vault/individual-vault/vault-filter/components/vault-filter.component.html b/apps/web/src/app/vault/individual-vault/vault-filter/components/vault-filter.component.html
+index 96ef650..d1d096e 100644
+--- a/apps/web/src/app/vault/individual-vault/vault-filter/components/vault-filter.component.html
++++ b/apps/web/src/app/vault/individual-vault/vault-filter/components/vault-filter.component.html
+@@ -38,6 +38,7 @@
+               [activeFilter]="activeFilter"
+               [section]="f"
+               [isCollectionFilter]="f === filters?.collectionFilter"
++              [showItemCounts]="true"
+             >
+             </app-filter-section>
+           </div>
+diff --git a/apps/web/src/app/vault/individual-vault/vault-filter/shared/components/vault-filter-section.component.html b/apps/web/src/app/vault/individual-vault/vault-filter/shared/components/vault-filter-section.component.html
+index ff4d5fc..85f886e 100644
+--- a/apps/web/src/app/vault/individual-vault/vault-filter/shared/components/vault-filter-section.component.html
++++ b/apps/web/src/app/vault/individual-vault/vault-filter/shared/components/vault-filter-section.component.html
+@@ -98,6 +98,10 @@
+                 &nbsp;{{ f.node.name }}
+               </button>
+               <span class="tw-ml-auto tw-flex tw-items-center">
++                @let count = itemCount(f);
++                @if (count !== null) {
++                  <span class="tw-shrink-0 tw-ps-2 tw-tabular-nums tw-text-muted">{{ count }}</span>
++                }
+                 @if (editInfo() && f.node.id) {
+                   <button
+                     type="button"
+diff --git a/apps/web/src/app/vault/individual-vault/vault-filter/shared/components/vault-filter-section.component.ts b/apps/web/src/app/vault/individual-vault/vault-filter/shared/components/vault-filter-section.component.ts
+index 0c28008..0bc5ff0 100644
+--- a/apps/web/src/app/vault/individual-vault/vault-filter/shared/components/vault-filter-section.component.ts
++++ b/apps/web/src/app/vault/individual-vault/vault-filter/shared/components/vault-filter-section.component.ts
+@@ -5,15 +5,21 @@ import { toObservable, toSignal } from "@angular/core/rxjs-interop";
+ import { firstValueFrom, Observable } from "rxjs";
+ import { map, switchMap } from "rxjs/operators";
+ 
++import { Unassigned } from "@bitwarden/common/admin-console/models/collections";
+ import { Organization } from "@bitwarden/common/admin-console/models/domain/organization";
+ import { AccountService } from "@bitwarden/common/auth/abstractions/account.service";
+ import { getUserId } from "@bitwarden/common/auth/services/account.service";
++import { OrganizationId } from "@bitwarden/common/types/guid";
++import { CipherService } from "@bitwarden/common/vault/abstractions/cipher.service";
+ import { ITreeNodeObject, TreeNode } from "@bitwarden/common/vault/models/domain/tree-node";
++import { CipherViewLike } from "@bitwarden/common/vault/utils/cipher-view-like-utils";
+ import {
+   VaultFilterServiceAbstraction as VaultFilterService,
+   VaultFilterSection,
+   VaultFilterType,
+   VaultFilter,
++  createFilterFunction,
++  isRoutedVaultFilterItemType,
+ } from "@bitwarden/vault";
+ 
+ import { CoachmarkService } from "../../../../components/coachmark";
+@@ -37,7 +43,17 @@ export class VaultFilterSectionComponent {
+   // eslint-disable-next-line @angular-eslint/prefer-signals
+   @Input() isCollectionFilter = false;
+ 
++  /** Whether to show how many items each type filter lists (individual vault only) */
++  // eslint-disable-next-line @angular-eslint/prefer-signals
++  @Input() showItemCounts = false;
++
+   protected readonly coachmarkService = inject(CoachmarkService);
++  private readonly cipherService = inject(CipherService);
++
++  private readonly ciphers = toSignal(
++    this.activeUserId$.pipe(switchMap((userId) => this.cipherService.cipherListViews$(userId))),
++    { initialValue: null },
++  );
+ 
+   /** Computed signal for collections coachmark open state */
+   protected readonly collectionsCoachmarkOpen = computed(
+@@ -93,6 +109,30 @@ export class VaultFilterSectionComponent {
+     );
+   }
+ 
++  /**
++   * The number of items the vault lists for a type filter (favorites, item types, archive, trash)
++   * in the selected vault, or null for other filters.
++   */
++  itemCount(filterNode: TreeNode<VaultFilterType>): number | null {
++    const ciphers = this.ciphers() as CipherViewLike[] | null;
++    const type = filterNode?.node.id;
++    if (!this.showItemCounts || ciphers == null || !isRoutedVaultFilterItemType(type)) {
++      return null;
++    }
++
++    const organizationId = this.activeFilter.organizationId;
++    const filterFunction = createFilterFunction({
++      type,
++      organizationId:
++        organizationId === "MyVault"
++          ? Unassigned
++          : organizationId == null || organizationId === "AllVaults"
++            ? undefined
++            : (organizationId as OrganizationId),
++    });
++    return ciphers.filter(filterFunction).length;
++  }
++
+   async onFilterSelect(filterNode: TreeNode<VaultFilterType>) {
+     if (this.section().premiumOptions?.blockFilterAction) {
+       await this.section().premiumOptions.blockFilterAction();

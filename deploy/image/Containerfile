@@ -9,7 +9,7 @@
 
 # The web vault is built from source like bw_web_builds v2026.8.0 (the commit
 # of vaultwarden/vw_web_builds it uses), plus the fork's patches in
-# deploy/web-vault/patches.
+# deploy/web-vault-patches.
 FROM --platform=linux/amd64 docker.io/library/node:24.22.1-trixie AS vault
 ARG VW_WEB_BUILDS_COMMIT=a868ea02ea78b4a0eb8656664cf8d29f9fdab8c2
 WORKDIR /clients
@@ -17,7 +17,7 @@ RUN git init -q \
     && git fetch -q --depth 1 https://github.com/vaultwarden/vw_web_builds.git "${VW_WEB_BUILDS_COMMIT}" \
     && git -c advice.detachedHead=false checkout -q FETCH_HEAD \
     && npm ci
-COPY deploy/web-vault/patches /patches
+COPY deploy/web-vault-patches /patches
 RUN git apply /patches/*.patch \
     && cd apps/web \
     && npm run dist:oss:selfhost \

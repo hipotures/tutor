@@ -16,4 +16,4 @@
 !rustfmt.toml
 !rust-toolchain.toml
 
-!deploy/web-vault/patches
+!deploy/web-vault-patches/*.patch
