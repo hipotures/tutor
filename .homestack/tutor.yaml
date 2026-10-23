@@ -6,6 +6,12 @@ image:
   repository: ghcr.io/hipotures/tutor
 
 runtime:
+  # Provisional defaults; built-image resource measurements are pending.
+  resources:
+    cores: 1
+    memory: 256M
+    swap: 0M
+    rootfs: 512M
   ports:
     - name: web
       port: 80
@@ -18,9 +24,18 @@ runtime:
 
 persistence:
   mount: /home/app
+  # Provisional capacity; durable-data and growth measurements are pending.
+  size: 1G
   directories:
     - data
 
 deployment:
-  multi_node: false
+  instances: 1
+  placement: single
   state_model: local
+
+exposure:
+  pangolin:
+    port: web
+    name: Tutor
+    subdomain: tutor

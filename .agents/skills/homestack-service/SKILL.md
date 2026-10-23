@@ -1,67 +1,135 @@
 ---
 name: homestack-service
-description: Prepare an application repository for deployment by HomeStack as a Proxmox LXC built from an OCI image, with persistent data in /home/app. Use when asked to make a service deployable through HomeStack, to write or review .homestack/*.yaml manifests, or to adapt a Containerfile/entrypoint for a persistent /home/app volume.
+description: Prepare an application repository for deployment by HomeStack as unprivileged Proxmox LXC containers built from an OCI image. Use when asked to make a service deployable through HomeStack, to write or review .homestack/*.yaml manifests (resources, persistence, instances, Pangolin exposure), to choose and test a minimal base image, or to implement the HomeStack health and telemetry endpoints.
 ---
 
 # HomeStack service authoring
 
-HomeStack deploys a service as one unprivileged Proxmox LXC per selected node,
-created from the service's published OCI image, with a dedicated persistent
-volume mounted at `/home/app`. You prepare the application side only: the
-image, its runtime data layout and a portable manifest. The exact manifest
-contract is in [manifest-schema.md](manifest-schema.md); follow it literally.
+HomeStack deploys a service as one or more unprivileged Proxmox LXC
+containers created from the service's published OCI image. You prepare the
+application side only: the image, its runtime data layout, its health and
+telemetry endpoints and a portable manifest that tells HomeStack how to
+deploy it. The exact manifest contract is in
+[manifest-schema.md](manifest-schema.md); follow it literally.
+
+This contract does not depend on the application's language or framework.
+It describes how the application behaves when HomeStack deploys it; it does
+not change what the application does.
 
 ## Boundary
 
-- You own: the Containerfile, the entrypoint, where the application writes
-  state, the release workflow that publishes the image, and `.homestack/*.yaml`.
-- HomeStack owns: nodes, CTIDs, IPs, storage, volume sizes, CPU/RAM, domains,
-  exposure and every secret. Never put any of these in the repository, the
-  image or the manifest, and never run Proxmox operations yourself.
+- You own: the Containerfile and base image choice, the entrypoint, where the
+  application writes state, health and telemetry endpoints, the release
+  workflow that publishes the image, and `.homestack/*.yaml` with the
+  service's default resources, persistence, instance count, placement and
+  Pangolin exposure.
+- HomeStack and its operator own: nodes, CTIDs, IPs, storage, the domain,
+  Pangolin sites and credentials, and every secret. The operator may change
+  any manifest default in the deployment form. Never put environment-specific
+  values or secrets in the repository, the image or the manifest, and never
+  run Proxmox operations yourself.
 
 ## Steps
 
 1. Read the repository's own instructions and the real runtime: how the image
    is built and published, the start command, listening ports, a real health
-   endpoint, and every path the application writes. Do not invent any of them.
+   endpoint, every path the application writes and every setting it needs at
+   start. Do not invent any of them.
 2. Decide what is one service: one independently deployable LXC. Several
    processes or ports in one container are one service with several ports.
    Do not add a manifest for something that is not deployable on its own.
-3. Put all persistent state under `/home/app/<directory>`:
-   - prefer the application's own setting (an environment variable or config
-     key pointing at `/home/app/data`) over symlinks;
-   - if a path cannot be configured, have the entrypoint link it into the
-     mount, and check the link never hides or replaces existing data;
-   - SQLite databases and their `-wal`/`-shm` files stay together inside the
-     mount; never copy a live database with `cp`;
-   - logs go to stdout/stderr unless there is a real reason to keep them.
-4. Make the image safe for an empty, then reused, volume:
-   - keep `/home/app` an empty directory in the image; nothing baked there
-     survives the mount;
-   - in the entrypoint, create the needed directories with `mkdir -p` after
-     the mount is present, never reinitialise or overwrite existing data;
-   - refuse to start when `/home/app` is a symlink or not a mounted volume,
-     unless an explicit opt-in for throwaway tests is set;
-   - do not declare `VOLUME` and do not mount anything in the image;
-   - the LXC is unprivileged: run as container root or a fixed service user
-     that owns its directories; never fix permissions with world-writable modes.
-5. Set up image releases to the standard below; it is required, not optional.
-   Adapt a working build to it rather than replacing it wholesale.
-6. Write `.homestack/<id>.yaml` per the schema. `multi_node: true` only when
-   independent simultaneous instances are genuinely safe (`stateless`, or
-   `external` shared state designed for it). Local SQLite means
-   `multi_node: false` and `state_model: local`. A health check must be real:
-   use HTTP only if the service serves that path; otherwise `tcp` or none.
-   An HTTP service exposes the standard health endpoints below and the
-   manifest points at its readiness endpoint. It also implements the
-   [service telemetry contract](service-status.md) on that same HTTP port.
-7. Verify without touching any cluster: the YAML parses and satisfies the
-   schema; the service starts with an empty `/home/app`, writes its state
-   there, and keeps it across a restart.
-8. Document the service's runtime contract next to its image, including the
-   settings HomeStack must provide at deployment time (never their values).
+3. Choose the base image and build the image as described in
+   [image-build-preflight.md](image-build-preflight.md): the lightest runtime
+   the application actually works on without substantial code changes.
+4. Decide whether the service has durable state (see Persistence below). If
+   it has, put all of it under `/home/app/<directory>`; if not, leave `persistence:`
+   empty and make sure the service starts on a fresh root.
+5. Implement the health endpoints and the telemetry endpoint on the existing
+   HTTP listener (see below).
+6. Decide the instance topology: how many production instances a normal
+   deployment creates and whether they go one per node.
+7. Run the built image locally with the exact resources you intend to
+   declare, measure it, and adjust until it works within them
+   ([image-build-preflight.md](image-build-preflight.md)).
+8. Write `.homestack/<id>.yaml` per the schema with the measured resources,
+   persistence, topology and Pangolin exposure. Write every top-level section;
+   leave `persistence:` or `exposure:` empty to switch that feature off.
+9. Set up image releases to the standard below. Adapt a working build to it
+   rather than replacing it wholesale.
+10. Document the service's runtime contract next to its image: base image and
+    why, ports, state paths, measured resources and the workload used, and the
+    settings HomeStack must provide at deployment time (never their values).
 
-## Health endpoint standard
+## Persistence
+
+The root filesystem is disposable: HomeStack recreates it from the image on
+every update. Durable data lives only on the optional home volume mounted at
+`/home/app`.
+
+**Stateless service** (writes nothing it needs later, e.g. an API whose data
+lives elsewhere): leave `persistence:` empty in the manifest. HomeStack
+creates no home volume. The service must start correctly on a fresh root with only its
+image and the settings supplied at deployment. Temporary files on root are
+fine; anything that must survive an update is not.
+
+**Stateful service** (e.g. a local SQLite database): fill `persistence`
+with the volume size and directories.
+
+- Prefer the application's own setting (an environment variable or config key
+  pointing at `/home/app/data`) over symlinks. If a path cannot be configured,
+  have the entrypoint link it into the mount, and check the link never hides
+  or replaces existing data.
+- SQLite databases and their `-wal`/`-shm` files stay together inside the
+  mount; never copy a live database with `cp`, use the SQLite backup API.
+- Keep `/home/app` an empty directory in the image; nothing baked there
+  survives the mount. Do not declare `VOLUME` and do not mount anything in the
+  image.
+- In the entrypoint, create the needed directories with `mkdir -p` after the
+  mount is present; never reinitialise, overwrite or migrate away existing
+  data.
+- Refuse to start when `/home/app` is a symlink or not a mounted volume, unless
+  an explicit opt-in for throwaway tests is set.
+- The LXC is unprivileged: run as container root or a fixed service user that
+  owns its directories; never fix permissions with world-writable modes.
+
+Logs go to stdout/stderr unless there is a real reason to keep them.
+
+## Instances and placement
+
+`deployment.instances` is how many production instances one deployment
+creates, named `<id>-1`, `<id>-2`, … . `deployment.placement` says how they
+are spread over the Proxmox cluster:
+
+- `spread`: one instance per node. On a cluster with fewer nodes than
+  `instances`, HomeStack creates one per available node, never two on the
+  same node. Use it for a stateless service that clients can reach on any
+  node, e.g. an API deployed with `instances: 3`.
+- `single`: all instances on one node.
+
+`deployment.state_model` states what the instances share:
+
+- `stateless`: nothing local; any instance can serve any request.
+- `local`: each instance owns the data on its own home volume. A second
+  instance is a separate, initially empty data set, never a replica. A
+  service with one SQLite database is `local` with `instances: 1`.
+- `external`: shared state lives in an external service designed for
+  concurrent clients.
+
+The count is the normal production deployment, not a limit. The operator can
+always deploy an additional, separately named test instance (for example to
+check a new image or UI); it starts with its own empty home.
+
+This is not Proxmox HA: do not configure HA, replication or shared storage
+as part of authoring a service.
+
+## Network, health and TLS
+
+The service serves plain HTTP inside the private LAN. Pangolin terminates
+public HTTPS, handles certificates and remote authentication. Do not bundle
+certificates, a TLS-only proxy or an extra login only for this purpose; the
+application's own accounts and permissions are separate. An existing
+TLS-only service must actually be changed to serve HTTP before its manifest
+declares an HTTP port.
 
 HTTP services expose health in the "Health Check Response Format for HTTP
 APIs" (draft-inadarei-api-health-check), never as free text:
@@ -76,46 +144,51 @@ APIs" (draft-inadarei-api-health-check), never as free text:
   internal error details in the body.
 
 The manifest's `runtime.healthcheck` uses `/health/ready` with
-`expected_status: 200`. Keep pre-existing health URLs working if something
-else depends on them.
+`expected_status: 200`; HomeStack and the Pangolin resource both use it. Use
+`tcp` only when the service has no HTTP endpoint, and no health check when
+neither is real. Keep pre-existing health URLs working if something else
+depends on them.
+
+## Pangolin exposure
+
+Declare `exposure.pangolin` when the service should be reachable through
+Pangolin: the port to expose, the resource name and the subdomain. HomeStack
+creates one Pangolin resource for the service with every instance as its
+target, under the domain the operator selects. Leave `exposure:` empty for
+services that are only used inside the LAN or have no inbound port.
 
 ## Service telemetry
 
 HTTP services implement `GET /.well-known/homestack/status`, returning
 `application/json` according to [service-status.md](service-status.md). Read
-that contract when implementing or reviewing the endpoint. It is independent
-of the application's language and separate from health/readiness. Use the
-existing HTTP server and native OS APIs; no additional daemon, SSH, shell
-commands or framework replacement. Keep schema 1 YAML unchanged: the endpoint
-uses the HTTP healthcheck's declared port, with a fixed path.
+that contract when implementing or reviewing the endpoint. The path is fixed
+and served on the healthcheck's HTTP port; it needs no manifest field. HomeStack
+uses it to show the container's CPU, memory, pressure, I/O and the free space
+of `/` and `/home/app`.
 
-Report process uptime, the CPU, memory, pressure (PSI) and I/O of the
-service's own cgroup v2, and an array of actual data mounts including `/` and
-`/home/app`, with filesystem type and byte capacities. Never report
-`/proc/loadavg`: in a Proxmox LXC container it is the host's load, so
-`load_average` is always `null`. Detect mounts instead of assuming ext4: XFS,
-Btrfs, NFS and other supported filesystems use the same contract. Missing
-mounts, failed measurements and stale data must remain distinguishable from
-zero free space. These observations never prove Proxmox volume ownership and
-never authorize a lifecycle operation.
+Implement it inside the service with the language's native OS APIs, on the
+existing HTTP server; no additional daemon, SSH, shell commands or framework
+replacement. Telemetry must cost next to nothing: one background sampler at
+most every five seconds reads a handful of small files, and the handler
+returns the cached result without doing any work. Never sample per request.
 
-Implement the contract inside the service with native equivalents. The
-`crates/hs-service-status` crate in the HomeStack repository predates the
-`container` section and still reports host load; do not depend on it. Do not
-require Rust, publish a new package, or add an HTTP listener to a non-HTTP
-service merely because Rust implementations exist. Verify with local HTTP
-requests and compare filesystem values with `df -B1` or the platform
-equivalent, and container values with the files under `/sys/fs/cgroup`; also
-check an absent `/home/app`, a missing PSI file and a measurement failure
-without touching PVE.
+Never report `/proc/loadavg`: in a Proxmox LXC it is the host's load, so
+`load_average` is always `null`. Detect mounts instead of assuming ext4.
+Without a home volume, report `/home/app` as not mounted, never as root's
+numbers. Missing mounts, failed measurements and stale data must remain
+distinguishable from zero.
+
+Verify with local HTTP requests: compare filesystem values with `df -B1` and
+container values with the files under `/sys/fs/cgroup`; also check an absent
+`/home/app`, a missing PSI file and a measurement failure.
 
 ## Release standard
 
 Every service has its own independent SemVer version line:
 
 1. **Tags.** A release is the annotated Git tag `<id>-MAJOR.MINOR.PATCH`
-   (`<id>` is the manifest `id`, e.g. `tutor-0.1.2`). The prefix keeps several
-   services in one repository, and upstream tags in forks, apart.
+   (`<id>` is the manifest `id`, e.g. `example-0.1.2`). The prefix keeps
+   several services in one repository, and upstream tags in forks, apart.
 2. **Automatic numbering.** The repository has a tagging script (create it if
    missing, e.g. `scripts/tag-image.py`) that fetches tags, takes the highest
    `<id>-X.Y.Z`, creates the next patch version on a clean HEAD that is
@@ -134,15 +207,17 @@ Every service has its own independent SemVer version line:
    exists. A bad release is fixed by the next patch release.
 
 Not every change is a release. After committing and pushing a completed
-change, decide whether the running service changes: application code or
-dependencies it uses, the Containerfile, entrypoint or runtime files, or
-`image`/`runtime`/`persistence` in the manifest. If so, run the tagging script;
-if the change only touches documentation, tests, CI checks or tooling, do not.
-Record this rule in the repository's agent instructions (`AGENTS.md`) so
-agents working without this skill follow it too.
+change, decide whether the image changes: application code or dependencies
+it uses, the Containerfile, entrypoint or files baked into the image. If so,
+run the tagging script. HomeStack reads the manifest from the repository, so
+a change only to the manifest (resources, persistence size, instances,
+placement, exposure) needs no image release; neither do documentation,
+tests, CI checks or tooling. Record this rule in the repository's agent
+instructions (`AGENTS.md`) so agents working without this skill follow it too.
 
 ## Refuse
 
-Cluster-specific values or secrets in the manifest or image, shell commands in
-manifests, Docker-in-LXC, and claiming multi-node safety or health that the
-application does not actually have.
+Cluster-specific values or secrets in the manifest or image; shell commands
+in manifests; Docker-in-LXC or privileged containers; resource values that
+were not measured on the built image; claiming persistence, multi-instance
+safety or health that the application does not actually have.
