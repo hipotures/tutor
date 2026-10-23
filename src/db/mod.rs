@@ -179,6 +179,16 @@ impl Drop for DbPool {
 }
 
 impl DbPool {
+    #[cfg(all(test, sqlite))]
+    pub(crate) fn homestack_test_pool() -> Self {
+        let manager = DbConnManager::new("sqlite://:memory:");
+        let pool = Pool::builder().max_size(1).min_idle(Some(1)).build(manager).unwrap();
+        Self {
+            pool: Some(pool),
+            semaphore: Arc::new(Semaphore::new(1)),
+        }
+    }
+
     // For the given database URL, guess its type, run migrations, create pool, and return it
     pub fn from_config() -> Result<Self, Error> {
         let db_url = CONFIG.database_url();

@@ -271,38 +271,62 @@ fn health(pass: bool, checks: Option<Value>) -> HealthResponse {
     (status, (ContentType::new("application", "health+json"), Json(body)))
 }
 
-// Liveness: the server answers requests; no dependencies are checked.
+// Health routes are also mounted at root when DOMAIN includes a base path.
+pub fn homestack_health_routes() -> Vec<Route> {
+    routes![health_live, health_ready]
+}
+
 #[get("/health/live")]
-fn health_live() -> HealthResponse {
-    health(true, None)
+fn health_live(heartbeat: &State<Arc<crate::homestack_health::Heartbeat>>) -> HealthResponse {
+    let snapshot = heartbeat.snapshot();
+    health(snapshot.pass, Some(snapshot.checks()))
 }
 
-// Readiness: the server can serve the vault, i.e. it gets a database connection.
 #[get("/health/ready")]
-async fn health_ready(pool: &State<DbPool>) -> HealthResponse {
-    let database = pool.get().await.is_ok();
-    let check = json!([{ "status": if database { "pass" } else { "fail" } }]);
-    health(database, Some(json!({ "database:connection": check })))
+async fn health_ready(
+    pool: &State<DbPool>,
+    heartbeat: &State<Arc<crate::homestack_health::Heartbeat>>,
+) -> HealthResponse {
+    let snapshot = heartbeat.snapshot();
+    if !snapshot.pass {
+        return health(false, Some(snapshot.checks()));
+    }
+    let database =
+        tokio::time::timeout(std::time::Duration::from_secs(2), crate::homestack_health::database_ready(pool))
+            .await
+            .unwrap_or(false);
+    let snapshot = heartbeat.snapshot();
+    let mut checks = snapshot.checks();
+    checks["database:connection"] = json!([{ "status": if database { "pass" } else { "fail" } }]);
+    health(snapshot.pass && database, Some(checks))
 }
 
-// HomeStack service telemetry, see .agents/skills/homestack-service/service-status.md.
-// Mounted at "/" regardless of the DOMAIN base path, since HomeStack uses a fixed path.
+// A separate probe avoids making heartbeat recovery depend on its own freshness.
+#[get("/health/heartbeat")]
+async fn heartbeat_probe(pool: &State<DbPool>) -> Status {
+    if crate::homestack_health::database_ready(pool).await {
+        Status::NoContent
+    } else {
+        Status::ServiceUnavailable
+    }
+}
+
 pub fn homestack_status_routes() -> Vec<Route> {
-    routes![homestack_status]
+    routes![homestack_status, heartbeat_probe]
 }
 
 #[derive(Responder)]
 #[response(content_type = "json")]
 struct HomestackStatus(Json<crate::homestack_status::Report>, Header<'static>);
 
-// Answers from the sampler's cached measurements; never blocks on filesystem I/O.
-// Reaching this handler means the process is live, hence always "pass".
 #[get("/.well-known/homestack/status")]
-fn homestack_status(sampler: &State<crate::homestack_status::Sampler>) -> HomestackStatus {
-    HomestackStatus(
-        Json(sampler.report(crate::homestack_status::Status::Pass)),
-        Header::new("Cache-Control", "no-store"),
-    )
+async fn homestack_status(
+    telemetry: &State<crate::homestack_status::Telemetry>,
+    heartbeat: &State<Arc<crate::homestack_health::Heartbeat>>,
+) -> HomestackStatus {
+    let mut report = telemetry.report(crate::homestack_status::Status::Pass).await;
+    report.status = heartbeat.snapshot().status();
+    HomestackStatus(Json(report), Header::new("Cache-Control", "no-store"))
 }
 
 // This endpoint/function is used during development and development only.
@@ -355,5 +379,82 @@ pub fn static_files(filename: &str) -> Result<(ContentType, &'static [u8]), Erro
         "datatables.js" => Ok((ContentType::JavaScript, include_bytes!("../static/scripts/datatables.js"))),
         "datatables.css" => Ok((ContentType::CSS, include_bytes!("../static/scripts/datatables.css"))),
         _ => err!(format!("Static file not found: {filename}")),
+    }
+}
+
+#[cfg(all(test, sqlite))]
+mod homestack_tests {
+    use super::*;
+    use crate::{homestack_health::Heartbeat, homestack_status::Telemetry};
+    use rocket::local::asynchronous::Client;
+    use std::time::{Duration, Instant};
+
+    async fn client(started: Instant) -> Client {
+        Client::tracked(
+            rocket::build()
+                .mount("/vault", routes![health_live, health_ready])
+                .mount("/", homestack_health_routes())
+                .mount("/", homestack_status_routes())
+                .manage(Arc::new(Heartbeat::new(started, Duration::from_secs(10))))
+                .manage(Telemetry::start(started).unwrap())
+                .manage(DbPool::homestack_test_pool()),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[rocket::async_test]
+    async fn homestack_health_is_available_at_root_and_basepath() {
+        let client = client(Instant::now()).await;
+        for path in ["/health/live", "/health/ready", "/vault/health/live", "/vault/health/ready"] {
+            let response = client.get(path).dispatch().await;
+            assert_eq!(response.status(), Status::Ok, "{path}");
+            assert_eq!(response.content_type(), Some(ContentType::new("application", "health+json")));
+            let body = response.into_json::<Value>().await.unwrap();
+            assert_eq!(body["status"], "pass");
+            assert_eq!(body["checks"]["heartbeat:count"][0]["observedValue"], 0);
+            assert_eq!(body["checks"]["heartbeat:age"][0]["observedUnit"], "s");
+        }
+        assert_eq!(client.get("/health/heartbeat").dispatch().await.status(), Status::NoContent);
+        let response = client.get("/.well-known/homestack/status").dispatch().await;
+        assert_eq!(response.headers().get_one("Cache-Control"), Some("no-store"));
+        assert_eq!(response.content_type(), Some(ContentType::JSON));
+        let body = response.into_json::<Value>().await.unwrap();
+        assert_eq!(body["schema"], 2);
+        assert_eq!(body["status"], "pass");
+        assert!(body["sample_uptime_usec"].is_u64());
+    }
+
+    #[rocket::async_test]
+    async fn homestack_stale_heartbeat_fails_health_and_telemetry_but_probe_can_recover() {
+        let client = client(Instant::now() - Duration::from_secs(31)).await;
+        for path in ["/health/live", "/health/ready"] {
+            let response = client.get(path).dispatch().await;
+            assert_eq!(response.status(), Status::ServiceUnavailable);
+            let body = response.into_json::<Value>().await.unwrap();
+            assert_eq!(body["status"], "fail");
+            assert_eq!(body["checks"]["heartbeat:count"][0]["observedValue"], 0);
+        }
+        let response = client.get("/.well-known/homestack/status").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(response.into_json::<Value>().await.unwrap()["status"], "fail");
+        // Heartbeat probes remain independent of freshness, avoiding a recovery deadlock.
+        assert_eq!(client.get("/health/heartbeat").dispatch().await.status(), Status::NoContent);
+    }
+
+    #[rocket::async_test]
+    async fn homestack_readiness_times_out_when_database_pool_is_exhausted() {
+        let client = client(Instant::now()).await;
+        let pool = client.rocket().state::<DbPool>().unwrap();
+        let held = pool.get().await.unwrap();
+        let before = Instant::now();
+        let response = client.get("/health/ready").dispatch().await;
+        assert!(before.elapsed() < Duration::from_secs(3));
+        assert_eq!(response.status(), Status::ServiceUnavailable);
+        let body = response.into_json::<Value>().await.unwrap();
+        assert_eq!(body["checks"]["database:connection"][0]["status"], "fail");
+        assert_eq!(client.get("/health/live").dispatch().await.status(), Status::Ok);
+        drop(held);
+        assert_eq!(client.get("/health/ready").dispatch().await.status(), Status::Ok);
     }
 }

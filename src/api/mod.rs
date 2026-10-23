@@ -29,8 +29,8 @@ pub use crate::api::{
         unregister_push_device,
     },
     web::catchers as web_catchers,
-    web::homestack_status_routes,
     web::routes as web_routes,
+    web::{homestack_health_routes, homestack_status_routes},
     web::{invalidate_css_cache, static_files},
 };
 use crate::{

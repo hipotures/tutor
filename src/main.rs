@@ -35,6 +35,7 @@ use std::{
     str::FromStr,
     sync::{Arc, atomic::Ordering},
     thread,
+    time::Instant,
 };
 
 use tokio::{
@@ -55,6 +56,7 @@ mod config;
 mod crypto;
 #[macro_use]
 mod db;
+mod homestack_health;
 mod homestack_status;
 mod http_client;
 mod mail;
@@ -73,6 +75,7 @@ pub use util::is_running_in_container;
 
 #[rocket::main]
 async fn main() -> Result<(), Error> {
+    let started = Instant::now();
     install_rustls_crypto_provider();
     parse_args();
     launch_info();
@@ -94,7 +97,7 @@ async fn main() -> Result<(), Error> {
     db::models::TwoFactor::migrate_credential_to_passkey(&pool.get().await.unwrap()).await.unwrap();
 
     let extra_debug = matches!(level, log::LevelFilter::Trace | log::LevelFilter::Debug);
-    launch_rocket(pool, extra_debug).await // Blocks until program termination.
+    launch_rocket(pool, extra_debug, started).await // Blocks until program termination.
 }
 
 const HELP: &str = "\
@@ -561,7 +564,7 @@ async fn create_db_pool() -> db::DbPool {
     }
 }
 
-async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error> {
+async fn launch_rocket(pool: db::DbPool, extra_debug: bool, started: Instant) -> Result<(), Error> {
     let basepath = &CONFIG.domain_path();
 
     let mut config = rocket::Config::from(rocket::Config::figment());
@@ -580,10 +583,16 @@ async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error>
 
     // If adding more paths here, consider also adding them to
     // crate::utils::LOGGED_ROUTES to make sure they appear in the log
+    let health_routes = if basepath.is_empty() {
+        Vec::new()
+    } else {
+        api::homestack_health_routes()
+    };
     let instance = rocket::custom(config)
         .mount([basepath, "/"].concat(), api::web_routes())
         // A fixed path for HomeStack, independent of the DOMAIN base path
         .mount("/", api::homestack_status_routes())
+        .mount("/", health_routes)
         .mount([basepath, "/api"].concat(), api::core_routes())
         .mount([basepath, "/admin"].concat(), api::admin_routes())
         .mount([basepath, "/events"].concat(), api::core_events_routes())
@@ -594,7 +603,9 @@ async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error>
         .register([basepath, "/api"].concat(), api::core_catchers())
         .register([basepath, "/admin"].concat(), api::admin_catchers())
         .manage(pool)
-        .manage(homestack_status::Sampler::start()?)
+        .manage(homestack_status::Telemetry::start(started)?)
+        .manage(Arc::new(homestack_health::Heartbeat::from_env(started)))
+        .attach(homestack_health::fairing())
         .manage(Arc::clone(&WS_USERS))
         .manage(Arc::clone(&WS_ANONYMOUS_SUBSCRIPTIONS))
         .attach(util::AppHeaders())

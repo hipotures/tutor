@@ -1,12 +1,12 @@
 //! HomeStack service telemetry served at GET /.well-known/homestack/status,
 //! see .agents/skills/homestack-service/service-status.md.
 //!
-//! One background thread samples every five seconds and HTTP handlers only clone
-//! the latest sample, so a stalled network filesystem cannot block a request.
+//! One worker collects only when requested. Handlers wait at most two seconds;
+//! a stalled network filesystem cannot create more workers or block the listener.
 //! Resource figures come from the service's own cgroup v2. /proc/loadavg is not
 //! used: inside a Proxmox LXC container it is the host's load.
 
-// Counter deltas and CPU counts stay far below the 2^52 where f64 loses integers
+// CPU counts and quotas stay far below the 2^52 where f64 loses integers
 #![allow(clippy::cast_precision_loss)]
 
 use std::{
@@ -14,14 +14,13 @@ use std::{
     fs::File,
     io::Read,
     path::{Component, Path, PathBuf},
-    sync::{Arc, PoisonError, RwLock},
+    sync::{Arc, PoisonError, RwLock, mpsc},
     time::{Duration, Instant},
 };
 
 const MAX_FILESYSTEMS: usize = 128;
-const INTERVAL: Duration = Duration::from_secs(5);
-// Rates over shorter intervals would mostly measure sampling jitter
-const MIN_RATE_INTERVAL: Duration = Duration::from_millis(500);
+const MAX_WAIT: Duration = Duration::from_secs(2);
+const REUSE_FOR: Duration = Duration::from_secs(2);
 // cgroup interface files are small; io.stat grows by one line per device
 const MAX_CGROUP_FILE: u64 = 64 * 1024;
 
@@ -29,17 +28,17 @@ const MAX_CGROUP_FILE: u64 = 64 * 1024;
 #[serde(rename_all = "lowercase")]
 pub enum Status {
     Pass,
+    Fail,
 }
 
 #[derive(Serialize)]
 pub struct Report {
     schema: u32,
     /// Process liveness, independent of dependency readiness
-    status: Status,
+    pub status: Status,
     uptime_seconds: u64,
+    sample_uptime_usec: Option<u64>,
     sample_age_seconds: Option<u64>,
-    /// Always null: /proc/loadavg is not container-scoped, see `container.pressure`
-    load_average: Option<()>,
     filesystems: Vec<Filesystem>,
     container: Container,
     /// A stable error code, never a raw OS error
@@ -65,7 +64,7 @@ struct Filesystem {
 struct Container {
     cpu: Option<Cpu>,
     memory: Option<Memory>,
-    pressure: Pressure,
+    pressure: Option<Pressure>,
     io: Option<Io>,
     error: Option<&'static str>,
 }
@@ -74,14 +73,10 @@ struct Container {
 struct Cpu {
     /// Logical CPUs the cgroup may use: its cpuset, lowered by any visible cpu.max quota
     capacity_cpus: Option<f64>,
-    /// The fields below cover the last interval and are null until two samples exist
-    interval_seconds: Option<f64>,
-    /// 100 means one logical CPU fully busy
-    usage_percent: Option<f64>,
-    /// 100 means all of `capacity_cpus` fully busy
-    capacity_percent: Option<f64>,
-    user_percent: Option<f64>,
-    system_percent: Option<f64>,
+    /// Cumulative kernel counters; HomeStack computes rates between reports
+    usage_usec: u64,
+    user_usec: u64,
+    system_usec: u64,
     /// Null when the cpu controller is not enabled for the cgroup
     throttling: Option<Throttling>,
 }
@@ -90,7 +85,7 @@ struct Cpu {
 struct Throttling {
     periods: u64,
     throttled_periods: u64,
-    throttled_seconds: f64,
+    throttled_usec: u64,
 }
 
 #[derive(Clone, Serialize)]
@@ -141,14 +136,13 @@ struct PsiLine {
     total_usec: u64,
 }
 
-/// Block I/O rates from io.stat, summed over devices, over the last interval
+/// Cumulative block I/O counters, summed over devices
 #[derive(Clone, Serialize)]
 struct Io {
-    interval_seconds: f64,
-    read_bytes_per_second: f64,
-    write_bytes_per_second: f64,
-    read_ops_per_second: f64,
-    write_ops_per_second: f64,
+    read_bytes: u64,
+    write_bytes: u64,
+    read_ops: u64,
+    write_ops: u64,
 }
 
 struct Sample {
@@ -158,64 +152,99 @@ struct Sample {
     error: Option<&'static str>,
 }
 
-/// Initialize once during startup and share through Rocket's managed state
-pub struct Sampler {
-    started: Instant,
-    sample: Arc<RwLock<Sample>>,
+struct Shared {
+    sample: Sample,
+    finished: Option<Instant>,
+    in_flight: bool,
 }
 
-impl Sampler {
-    pub fn start() -> std::io::Result<Self> {
-        let sample = Arc::new(RwLock::new(Sample {
-            at: None,
-            filesystems: Vec::new(),
-            container: Container::default(),
-            error: Some("pending"),
+/// A single worker sleeps on its channel until an HTTP request needs a measurement.
+/// The short lock is never held across OS I/O or an await.
+pub struct Telemetry {
+    started: Instant,
+    shared: Arc<RwLock<Shared>>,
+    requests: mpsc::SyncSender<()>,
+    completed: tokio::sync::watch::Receiver<()>,
+}
+
+impl Telemetry {
+    pub fn start(started: Instant) -> std::io::Result<Self> {
+        let mut cgroup = None;
+        Self::with_collector(started, move || collect(&mut cgroup))
+    }
+
+    fn with_collector(started: Instant, mut collect: impl FnMut() -> Sample + Send + 'static) -> std::io::Result<Self> {
+        let shared = Arc::new(RwLock::new(Shared {
+            sample: Sample {
+                at: None,
+                filesystems: Vec::new(),
+                container: Container {
+                    error: Some("cgroup_unavailable"),
+                    ..Container::default()
+                },
+                error: Some("pending"),
+            },
+            finished: None,
+            in_flight: false,
         }));
-        let weak = Arc::downgrade(&sample);
+        let (requests, receiver) = mpsc::sync_channel(1);
+        let (completed, updates) = tokio::sync::watch::channel(());
+        let worker = Arc::clone(&shared);
         std::thread::Builder::new().name("homestack-status".to_owned()).spawn(move || {
-            // Counters from the previous sample, kept for rates
-            let mut state = State::default();
-            loop {
-                if weak.strong_count() == 0 {
-                    break;
-                }
-                // Do not hold a strong reference or the write lock across OS I/O
-                let next = collect(&mut state);
-                let Some(shared) = weak.upgrade() else {
-                    break;
-                };
-                *shared.write().unwrap_or_else(PoisonError::into_inner) = next;
-                drop(shared);
-                std::thread::sleep(INTERVAL);
+            while receiver.recv().is_ok() {
+                let next = collect();
+                let mut shared = worker.write().unwrap_or_else(PoisonError::into_inner);
+                shared.sample = next;
+                shared.finished = Some(Instant::now());
+                shared.in_flight = false;
+                // Notify while holding the lock so another request cannot miss completion.
+                completed.send_replace(());
             }
         })?;
         Ok(Self {
-            started: Instant::now(),
-            sample,
+            started,
+            shared,
+            requests,
+            completed: updates,
         })
     }
 
-    pub fn report(&self, status: Status) -> Report {
-        let sample = self.sample.read().unwrap_or_else(PoisonError::into_inner);
+    pub async fn report(&self, status: Status) -> Report {
+        let mut completed = self.completed.clone();
+        let wait = {
+            let mut shared = self.shared.write().unwrap_or_else(PoisonError::into_inner);
+            // Match the watched version to this cache state under the same lock.
+            completed.borrow_and_update();
+            if shared.finished.is_some_and(|at| at.elapsed() < REUSE_FOR) {
+                false
+            } else {
+                if !shared.in_flight {
+                    shared.in_flight = true;
+                    if self.requests.try_send(()).is_err() {
+                        shared.in_flight = false;
+                    }
+                }
+                shared.in_flight
+            }
+        };
+        if wait {
+            let _ = tokio::time::timeout(MAX_WAIT, completed.changed()).await;
+        }
+        let shared = self.shared.read().unwrap_or_else(PoisonError::into_inner);
+        let sample = &shared.sample;
         Report {
-            schema: 1,
+            schema: 2,
             status,
             uptime_seconds: self.started.elapsed().as_secs(),
+            sample_uptime_usec: sample
+                .at
+                .and_then(|at| u64::try_from(at.saturating_duration_since(self.started).as_micros()).ok()),
             sample_age_seconds: sample.at.map(|at| at.elapsed().as_secs()),
-            load_average: None,
             filesystems: sample.filesystems.clone(),
             container: sample.container.clone(),
             error: sample.error,
         }
     }
-}
-
-#[derive(Default)]
-struct State {
-    cgroup: Option<Cgroup>,
-    cpu: Option<(Instant, CpuStat)>,
-    io: Option<(Instant, IoStat)>,
 }
 
 fn bounded_file(path: impl AsRef<Path>, limit: u64) -> std::io::Result<String> {
@@ -247,14 +276,16 @@ fn unescape(value: &str) -> Option<String> {
 }
 
 /// Mount root, mount point and filesystem type of each mountinfo line
-fn mountinfo_entries(text: &str) -> impl Iterator<Item = (String, String, &str)> {
-    text.lines().filter_map(|line| {
-        let (left, right) = line.split_once(" - ")?;
-        let mut fields = left.split_whitespace().skip(3);
-        let root = unescape(fields.next()?)?;
-        let path = unescape(fields.next()?)?;
-        Some((root, path, right.split_whitespace().next()?))
-    })
+fn mountinfo_entries(text: &str) -> Option<Vec<(String, String, &str)>> {
+    text.lines()
+        .map(|line| {
+            let (left, right) = line.split_once(" - ")?;
+            let mut fields = left.split_whitespace().skip(3);
+            let root = unescape(fields.next()?)?;
+            let path = unescape(fields.next()?)?;
+            Some((root, path, right.split_whitespace().next()?))
+        })
+        .collect()
 }
 
 fn data_mount(path: &str, kind: &str) -> bool {
@@ -285,21 +316,18 @@ fn data_mount(path: &str, kind: &str) -> bool {
     )
 }
 
-fn collect(state: &mut State) -> Sample {
+fn collect(cgroup: &mut Option<Cgroup>) -> Sample {
     // Timestamp the beginning: an NFS call that eventually returns must not
-    // make old measurements appear fresh
+    // make old measurements appear fresh.
     let at = Instant::now();
     let mountinfo = bounded_file("/proc/self/mountinfo", 1024 * 1024).ok();
     let (filesystems, error) = filesystems(mountinfo.as_deref());
-    // Resolved once and again only when the cgroup stops answering, e.g. after a migration
-    if state.cgroup.as_ref().is_none_or(|cgroup| !cgroup.dir.join("cpu.stat").exists()) {
-        state.cgroup = None;
-        state.cpu = None;
-        state.io = None;
+    if cgroup.as_ref().is_none_or(|cgroup| !cgroup.dir.join("cgroup.type").exists()) {
+        *cgroup = None;
     }
     let resolved = match mountinfo.as_deref() {
-        _ if state.cgroup.is_some() => Ok(()),
-        Some(mountinfo) => Cgroup::resolve(mountinfo).map(|cgroup| state.cgroup = Some(cgroup)),
+        _ if cgroup.is_some() => Ok(()),
+        Some(mountinfo) => Cgroup::resolve(mountinfo).map(|resolved| *cgroup = Some(resolved)),
         None => Err("cgroup_unavailable"),
     };
     let container = resolved.map_or_else(
@@ -307,7 +335,7 @@ fn collect(state: &mut State) -> Sample {
             error: Some(error),
             ..Container::default()
         },
-        |()| container(state),
+        |()| container(cgroup.as_ref().expect("resolved cgroup")),
     );
     Sample {
         at: Some(at),
@@ -321,10 +349,11 @@ fn filesystems(mountinfo: Option<&str>) -> (Vec<Filesystem>, Option<&'static str
     let mut mounts = BTreeMap::new();
     let mut text_bytes = 0;
     let mut error = None;
-    match mountinfo {
-        Some(text) => {
-            for (_, path, kind) in mountinfo_entries(text) {
-                if data_mount(&path, kind) && std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
+    match mountinfo.and_then(mountinfo_entries).filter(|entries| !entries.is_empty()) {
+        Some(entries) => {
+            for (_, path, kind) in entries {
+                // File bind mounts are excluded, but an unreadable mount remains visible.
+                if data_mount(&path, kind) && !std::fs::metadata(&path).is_ok_and(|metadata| !metadata.is_dir()) {
                     text_bytes += path.len() + kind.len();
                     // Leave room for the two required entries and JSON fields
                     if mounts.len() >= MAX_FILESYSTEMS - 2 || text_bytes > 4 * 1024 {
@@ -418,6 +447,8 @@ impl Cgroup {
     fn from_text(membership: &str, mountinfo: &str) -> Result<Self, &'static str> {
         let path = membership.lines().find_map(|line| line.strip_prefix("0::")).ok_or("cgroup_unavailable")?;
         let (top, relative) = mountinfo_entries(mountinfo)
+            .ok_or("cgroup_unavailable")?
+            .into_iter()
             .filter(|(_, _, kind)| *kind == "cgroup2")
             .find_map(|(root, mount, _)| {
                 // A path outside the mount (e.g. "/../sibling") has no visible directory
@@ -519,53 +550,17 @@ impl IoStat {
     }
 }
 
-/// Elapsed time since the previous counters, when long enough for a rate
-fn interval(previous: Option<&(Instant, impl Copy)>, now: Instant) -> Option<f64> {
-    let elapsed = now.checked_duration_since(previous?.0)?;
-    (elapsed >= MIN_RATE_INTERVAL).then_some(elapsed.as_secs_f64())
-}
-
-fn container(state: &mut State) -> Container {
-    let Some(cgroup) = &state.cgroup else {
-        return Container::default();
-    };
-    let now = Instant::now();
-
-    let cpu = cgroup.read("cpu.stat").and_then(|text| CpuStat::parse(&text)).map(|stat| {
-        let previous = state.cpu;
-        let seconds = interval(previous.as_ref(), now);
-        // A decreasing counter means a reset: report nothing for this interval
-        let rates = seconds.and_then(|seconds| {
-            let old = previous?.1;
-            let percent =
-                |new: u64, old: u64| Some(round(new.checked_sub(old)? as f64 / (seconds * 1_000_000.0) * 100.0));
-            Some((
-                percent(stat.usage_usec, old.usage_usec)?,
-                percent(stat.user_usec, old.user_usec)?,
-                percent(stat.system_usec, old.system_usec)?,
-                stat.throttling.zip(old.throttling).and_then(|(new, old)| {
-                    Some(Throttling {
-                        periods: new.0.checked_sub(old.0)?,
-                        throttled_periods: new.1.checked_sub(old.1)?,
-                        throttled_seconds: round(new.2.checked_sub(old.2)? as f64 / 1_000_000.0),
-                    })
-                }),
-            ))
-        });
-        // Keep the older counters when the interval is too short for a rate
-        if seconds.is_some() || previous.is_none() {
-            state.cpu = Some((now, stat));
-        }
-        let capacity_cpus = cpu_capacity(cgroup);
-        Cpu {
-            capacity_cpus: capacity_cpus.map(round),
-            interval_seconds: rates.as_ref().and(seconds).map(round),
-            usage_percent: rates.as_ref().map(|r| r.0),
-            capacity_percent: rates.as_ref().zip(capacity_cpus).map(|(r, cpus)| round(r.0 / cpus)),
-            user_percent: rates.as_ref().map(|r| r.1),
-            system_percent: rates.as_ref().map(|r| r.2),
-            throttling: rates.and_then(|r| r.3),
-        }
+fn container(cgroup: &Cgroup) -> Container {
+    let cpu = cgroup.read("cpu.stat").and_then(|text| CpuStat::parse(&text)).map(|stat| Cpu {
+        capacity_cpus: cpu_capacity(cgroup).map(round),
+        usage_usec: stat.usage_usec,
+        user_usec: stat.user_usec,
+        system_usec: stat.system_usec,
+        throttling: stat.throttling.map(|(periods, throttled_periods, throttled_usec)| Throttling {
+            periods,
+            throttled_periods,
+            throttled_usec,
+        }),
     });
 
     let memory = cgroup.read("memory.current").and_then(|text| text.trim().parse().ok()).map(|usage_bytes| {
@@ -596,30 +591,17 @@ fn container(state: &mut State) -> Container {
         io: cgroup.read("io.pressure").and_then(|text| parse_psi(&text)),
     };
 
-    let io = cgroup.read("io.stat").and_then(|text| IoStat::parse(&text)).and_then(|stat| {
-        let previous = state.io;
-        let seconds = interval(previous.as_ref(), now);
-        let rates = seconds.and_then(|seconds| {
-            let old = previous?.1;
-            let rate = |new: u64, old: u64| Some(round(new.checked_sub(old)? as f64 / seconds));
-            Some(Io {
-                interval_seconds: round(seconds),
-                read_bytes_per_second: rate(stat.read_bytes, old.read_bytes)?,
-                write_bytes_per_second: rate(stat.write_bytes, old.write_bytes)?,
-                read_ops_per_second: rate(stat.read_ops, old.read_ops)?,
-                write_ops_per_second: rate(stat.write_ops, old.write_ops)?,
-            })
-        });
-        if seconds.is_some() || previous.is_none() {
-            state.io = Some((now, stat));
-        }
-        rates
+    let io = cgroup.read("io.stat").and_then(|text| IoStat::parse(&text)).map(|stat| Io {
+        read_bytes: stat.read_bytes,
+        write_bytes: stat.write_bytes,
+        read_ops: stat.read_ops,
+        write_ops: stat.write_ops,
     });
 
     Container {
         cpu,
         memory,
-        pressure,
+        pressure: Some(pressure),
         io,
         error: None,
     }
@@ -693,4 +675,263 @@ fn parse_psi(text: &str) -> Option<Psi> {
         some: line("some")?,
         full: line("full"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn sample() -> Sample {
+        Sample {
+            at: Some(Instant::now()),
+            filesystems: Vec::new(),
+            container: Container::default(),
+            error: None,
+        }
+    }
+
+    #[rocket::async_test]
+    async fn homestack_telemetry_is_idle_and_coalesces_requests() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker_calls = Arc::clone(&calls);
+        let telemetry = Telemetry::with_collector(Instant::now(), move || {
+            worker_calls.fetch_add(1, Ordering::SeqCst);
+            sample()
+        })
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let reports = futures::future::join_all((0..16).map(|_| telemetry.report(Status::Pass))).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(reports.iter().all(|r| r.schema == 2 && r.sample_uptime_usec == reports[0].sample_uptime_usec));
+        let json = serde_json::to_value(&reports[0]).unwrap();
+        assert!(json.get("load_average").is_none());
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        telemetry.shared.write().unwrap().finished = Instant::now().checked_sub(REUSE_FOR);
+        telemetry.report(Status::Pass).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[rocket::async_test]
+    async fn homestack_stalled_measurement_is_bounded_and_preserves_age() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker_calls = Arc::clone(&calls);
+        let (release, blocked) = mpsc::channel();
+        let telemetry = Telemetry::with_collector(Instant::now() - Duration::from_secs(100), move || {
+            let next = sample();
+            if worker_calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                blocked.recv().unwrap();
+            }
+            next
+        })
+        .unwrap();
+        telemetry.report(Status::Pass).await;
+        {
+            let mut shared = telemetry.shared.write().unwrap();
+            shared.finished = Instant::now().checked_sub(REUSE_FOR);
+            shared.sample.at = Some(Instant::now() - Duration::from_secs(40));
+        }
+        let before = Instant::now();
+        let reports = futures::future::join_all((0..12).map(|_| telemetry.report(Status::Pass))).await;
+        assert!(before.elapsed() < Duration::from_secs(3));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(reports.iter().all(|r| r.sample_age_seconds.unwrap() >= 40));
+        release.send(()).unwrap();
+        telemetry.report(Status::Pass).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[rocket::async_test]
+    async fn homestack_first_stalled_measurement_reports_pending() {
+        let (release, blocked) = mpsc::channel();
+        let telemetry = Telemetry::with_collector(Instant::now(), move || {
+            let next = sample();
+            blocked.recv().unwrap();
+            next
+        })
+        .unwrap();
+        let report = telemetry.report(Status::Pass).await;
+        assert_eq!(report.error, Some("pending"));
+        assert!(report.sample_age_seconds.is_none() && report.sample_uptime_usec.is_none());
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn homestack_mount_failures_are_not_missing_mounts_or_zero_space() {
+        let text = "1 0 0:1 / / rw - xfs /dev/test rw\n2 1 0:2 / /__tutor_missing_mount rw - nfs server:/share rw\n";
+        let (filesystems, error) = filesystems(Some(text));
+        assert!(error.is_none());
+        let failed = filesystems.iter().find(|fs| fs.mount == "/__tutor_missing_mount").unwrap();
+        assert!(failed.mounted);
+        assert_eq!(failed.filesystem.as_deref(), Some("nfs"));
+        assert_eq!(failed.error, Some("measurement_unavailable"));
+        assert!(failed.available_bytes.is_none());
+        let home = filesystems.iter().find(|fs| fs.mount == "/home/app").unwrap();
+        assert!(!home.mounted && home.available_bytes.is_none());
+        assert_eq!(home.error, Some("not_mounted"));
+    }
+
+    #[test]
+    fn homestack_invalid_mount_inventory_is_an_error() {
+        for inventory in [None, Some(""), Some("broken"), Some("1 0 0:1 / / rw - ext4 dev rw\nbroken")] {
+            let (mounts, error) = filesystems(inventory);
+            assert_eq!(error, Some("mount_inventory_unavailable"));
+            assert_eq!(mounts.len(), 2);
+            assert!(mounts.iter().all(|fs| !fs.mounted && fs.error == error && fs.total_bytes.is_none()));
+        }
+        assert_eq!(unescape("/a\\040b\\134c").as_deref(), Some("/a b\\c"));
+    }
+
+    #[test]
+    fn homestack_missing_cgroup_and_psi_are_null() {
+        let unavailable = serde_json::to_value(Container {
+            error: Some("cgroup_unavailable"),
+            ..Container::default()
+        })
+        .unwrap();
+        for field in ["cpu", "memory", "pressure", "io"] {
+            assert!(unavailable[field].is_null());
+        }
+        assert!(parse_psi("").is_none());
+        let psi = parse_psi("some avg10=0.10 avg60=0.20 avg300=0.30 total=456\n").unwrap();
+        assert!(psi.full.is_none());
+        assert_eq!(psi.some.total_usec, 456);
+    }
+
+    #[test]
+    fn homestack_counters_are_cumulative_and_overflow_is_unavailable() {
+        let cpu = CpuStat::parse("usage_usec 7000000\nuser_usec 5000000\nsystem_usec 2000000\nnr_periods 30\nnr_throttled 4\nthrottled_usec 12345\n").unwrap();
+        assert_eq!(cpu.usage_usec, 7_000_000);
+        assert_eq!(cpu.throttling, Some((30, 4, 12345)));
+        let io =
+            IoStat::parse("8:0 rbytes=100 wbytes=200 rios=3 wios=4\n8:1 rbytes=50 wbytes=60 rios=1 wios=2\n").unwrap();
+        assert_eq!((io.read_bytes, io.write_bytes, io.read_ops, io.write_ops), (150, 260, 4, 6));
+        assert!(IoStat::parse("8:0 rbytes=18446744073709551615\n8:1 rbytes=1\n").is_none());
+        assert!(!data_mount("/proc", "proc"));
+        assert!(data_mount("/home/app", "tmpfs"));
+        assert!(data_mount("/mnt/data", "fuse.sshfs"));
+    }
+
+    #[test]
+    fn homestack_cgroup_reports_raw_counters_and_visible_limits() {
+        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let top = std::env::temp_dir().join(format!("tutor-cgroup-{}-{unique}", std::process::id()));
+        let dir = top.join("service");
+        std::fs::create_dir_all(&dir).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).unwrap();
+            }
+        }
+        let _cleanup = Cleanup(top.clone());
+        for (file, text) in [
+            ("cgroup.type", "domain"),
+            (
+                "cpu.stat",
+                "usage_usec 700
+user_usec 500
+system_usec 200
+nr_periods 30
+nr_throttled 4
+throttled_usec 12345
+",
+            ),
+            ("cpu.max", "max 100000"),
+            ("cpuset.cpus.effective", "0-3"),
+            ("memory.current", "1234"),
+            ("memory.max", "268435456"),
+            (
+                "memory.stat",
+                "anon 1000
+file 234
+",
+            ),
+            (
+                "memory.events",
+                "high 0
+max 1
+oom 0
+oom_kill 0
+",
+            ),
+            (
+                "io.stat",
+                "8:0 rbytes=100 wbytes=200 rios=3 wios=4
+",
+            ),
+        ] {
+            std::fs::write(dir.join(file), text).unwrap();
+        }
+        std::fs::write(top.join("cpu.max"), "50000 100000").unwrap();
+        std::fs::write(top.join("memory.max"), "134217728").unwrap();
+        let mountinfo = format!(
+            "1 0 0:1 / {} rw - cgroup2 cgroup rw
+",
+            top.display()
+        );
+        let cgroup = Cgroup::from_text(
+            "0::/service
+",
+            &mountinfo,
+        )
+        .unwrap();
+        let json = serde_json::to_value(container(&cgroup)).unwrap();
+        assert_eq!(json["cpu"]["usage_usec"], 700);
+        assert_eq!(json["cpu"]["capacity_cpus"], 0.5);
+        assert_eq!(json["cpu"]["throttling"]["throttled_usec"], 12345);
+        assert!(json["cpu"].get("usage_percent").is_none());
+        assert_eq!(json["memory"]["usage_bytes"], 1234);
+        assert_eq!(json["memory"]["limit_bytes"], 134217728);
+        assert_eq!(json["memory"]["events"]["max"], 1);
+        assert!(json["pressure"]["cpu"].is_null());
+        assert_eq!(json["io"]["write_bytes"], 200);
+        assert!(
+            Cgroup::from_text(
+                "0::/../sibling
+",
+                &mountinfo
+            )
+            .is_err()
+        );
+        assert_eq!(
+            Cgroup::from_text(
+                "0::/
+", &mountinfo
+            )
+            .err(),
+            Some("host_cgroup")
+        );
+    }
+
+    #[test]
+    fn homestack_bounded_mounts_fit_the_response_limit() {
+        // Exercise worst-case JSON escaping and 20-digit byte counts at the
+        // inventory's mount-count and combined text limits.
+        let filesystems = (0..MAX_FILESYSTEMS)
+            .map(|index| Filesystem {
+                mount: format!("/{index:03}{}", "\u{1}".repeat(27)),
+                filesystem: Some("x".to_owned()),
+                mounted: true,
+                total_bytes: Some(u64::MAX),
+                used_bytes: Some(u64::MAX),
+                free_bytes: Some(u64::MAX),
+                available_bytes: Some(u64::MAX),
+                error: None,
+            })
+            .collect();
+        let report = Report {
+            schema: 2,
+            status: Status::Pass,
+            uptime_seconds: u64::MAX,
+            sample_uptime_usec: Some(u64::MAX),
+            sample_age_seconds: Some(u64::MAX),
+            filesystems,
+            container: Container::default(),
+            error: Some("too_many_mounts"),
+        };
+        assert!(serde_json::to_vec(&report).unwrap().len() < 60 * 1024);
+    }
 }

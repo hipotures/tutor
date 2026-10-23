@@ -42,13 +42,14 @@ the affected behavior separately when required.
 ## Image releases
 
 After committing and pushing a completed change, decide whether it changes the
-running service: server code or its dependencies, migrations, the
-`deploy/image/` Containerfile, entrypoint or runtime files, or the `image`,
-`runtime` or `persistence` sections of `.homestack/tutor.yaml`. If it does,
+image: server code or its dependencies, migrations, the `deploy/image/`
+Containerfile, entrypoint or other files baked into the image. If it does,
 release it with `python3 scripts/tag-image.py`, which picks the next
 `tutor-X.Y.Z` and pushes the tag; CI publishes `ghcr.io/hipotures/tutor:X.Y.Z`.
-Do not release changes confined to documentation, tests, CI checks, upstream
-workflows or tooling.
+HomeStack reads the manifest from the repository: changes only to
+`.homestack/tutor.yaml` (resources, persistence size, instances, placement or
+exposure) need no image release. Do not release changes confined to
+documentation, tests, CI checks, upstream workflows or tooling.
 
 Never pick versions by hand, and never move, delete or force-push release tags.
 To test an image without releasing it, run the `Tutor image` workflow manually

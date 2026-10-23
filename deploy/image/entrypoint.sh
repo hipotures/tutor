@@ -11,9 +11,12 @@ if [ -L "${APP_HOME}" ] || [ ! -d "${APP_HOME}" ]; then
     exit 1
 fi
 
-# The volume must not be the container's disposable root: data written there
-# would be lost when the container is replaced with a newer image.
-if [ "$(stat -c %d "${APP_HOME}")" = "$(stat -c %d /)" ] && [ -z "${I_REALLY_WANT_VOLATILE_STORAGE:-}" ]; then
+# Require this exact mount point. A bind mount may share the root's device,
+# while an ordinary directory on another nested filesystem is not the home mount.
+if [ "${I_REALLY_WANT_VOLATILE_STORAGE:-}" != true ] && ! awk '
+    $5 == "/home/app" { mounted = 1 }
+    END { exit !mounted }
+' /proc/self/mountinfo; then
     echo "${APP_HOME} is not a mounted volume; refusing to keep the vault on the disposable root." >&2
     echo "Mount a persistent volume at ${APP_HOME}, or set I_REALLY_WANT_VOLATILE_STORAGE=true for a throwaway test." >&2
     exit 1
