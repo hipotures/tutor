@@ -13,7 +13,10 @@ patch version `tutor-X.Y.Z` and pushes the tag (`--dry-run` only prints it).
 The tag runs `.github/workflows/tutor-image.yml`, which builds
 [`Containerfile`](Containerfile) for `linux/amd64` and publishes
 `ghcr.io/hipotures/tutor:X.Y.Z`; it refuses to overwrite a version that is
-already published. The `tutor-` prefix keeps fork releases apart from upstream
+already published. If the tagged commit already has a `dev-<commit>` image
+(from a manual run), the workflow copies that tested image to `X.Y.Z`
+instead of rebuilding; it then reports the dev build's version
+(`tutor-dev-<commit>`). The `tutor-` prefix keeps fork releases apart from upstream
 Vaultwarden tags. Only `X.Y.Z` image tags are releases; a manual workflow run
 publishes `dev-<commit>` images for testing, and ordinary pushes publish
 nothing. The package is public, so a Proxmox node pulls it without

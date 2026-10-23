@@ -51,13 +51,38 @@ jobs:
             echo "ghcr.io/${IMAGE,,}:$TAG is already published" >&2
             exit 1
           fi
+      # A release of a commit that already has a tested dev-<commit> image
+      # promotes that image instead of rebuilding it. It keeps the dev build's
+      # embedded version and image labels.
+      - name: Tested dev image
+        id: dev
+        if: github.ref_type == 'tag'
+        env:
+          SHA: ${{ github.sha }}
+          IMAGE: ${{ github.repository_owner }}/tutor
+        run: |
+          token=$(curl -fsS "https://ghcr.io/token?scope=repository:${IMAGE,,}:pull" | jq -r .token)
+          status=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json' \
+            "https://ghcr.io/v2/${IMAGE,,}/manifests/dev-${SHA::12}")
+          if [[ "$status" == 200 ]]; then
+            echo "image=ghcr.io/${IMAGE,,}:dev-${SHA::12}" >> "$GITHUB_OUTPUT"
+          fi
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3.4.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6.18.0
+      - name: Promote the tested dev image
+        if: steps.dev.outputs.image != ''
+        env:
+          DEV_IMAGE: ${{ steps.dev.outputs.image }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          IMAGE: ${{ github.repository_owner }}/tutor
+        run: docker buildx imagetools create --tag "ghcr.io/${IMAGE,,}:$TAG" "$DEV_IMAGE"
+      - if: steps.dev.outputs.image == ''
+        uses: docker/build-push-action@v6.18.0
         with:
           context: .
           file: deploy/image/Containerfile

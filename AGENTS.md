@@ -18,3 +18,10 @@ workflows or tooling.
 Never pick versions by hand, and never move, delete or force-push release tags.
 To test an image without releasing it, run the `Tutor image` workflow manually
 (it publishes `dev-<commit>`).
+
+When a `dev-<commit>` image has been tested successfully (by your own checks,
+or by the user confirming it works), release that same commit with
+`tag-image.py` without new commits in between: CI then copies the tested
+`dev-<commit>` image to `X.Y.Z` instead of rebuilding it. A promoted image keeps
+the dev build's embedded version (`tutor-dev-<commit>`) and labels. A release
+of a commit without a dev image is built from scratch.
