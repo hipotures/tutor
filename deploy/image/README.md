@@ -32,6 +32,7 @@ credentials.
 | Telemetry | `GET /.well-known/homestack/status` on port 80 (always at the root, regardless of the `DOMAIN` path): uptime, mount capacities, and CPU, memory, PSI and I/O of the service's own cgroup v2 per the skill's `service-status.md` (`src/homestack_status.rs`); `load_average` is always `null`. For the management network only: a public proxy must not route this path |
 | Persistent volume | `/home/app`, mounted by HomeStack before the first start |
 | State | `/home/app/data` (`DATA_FOLDER`): `db.sqlite3` with its `-wal`/`-shm` files, `rsa_key.pem`, `config.json`, `attachments/`, `sends/`, `icon_cache/`, `tmp/` |
+| Web vault | `/web-vault`, built from source with the fork's patches (`deploy/web-vault/`) |
 | Logs | stdout/stderr |
 | User | container root (the LXC is unprivileged, so it maps to an unprivileged host UID); the volume is owned by container root |
 | Instances | one: local SQLite (`multi_node: false`, `state_model: local`) |

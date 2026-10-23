@@ -7,7 +7,22 @@
 # (persistent /home/app, port, health check) is in deploy/image/README.md and
 # .homestack/tutor.yaml.
 
-FROM --platform=linux/amd64 docker.io/vaultwarden/web-vault@sha256:632375471c7c06a799335cd74dfeaef63f92f45f9cd322c337ae7ad70081e48a AS vault
+# The web vault is built from source like bw_web_builds v2026.8.0 (the commit
+# of vaultwarden/vw_web_builds it uses), plus the fork's patches in
+# deploy/web-vault/patches.
+FROM --platform=linux/amd64 docker.io/library/node:24.22.1-trixie AS vault
+ARG VW_WEB_BUILDS_COMMIT=a868ea02ea78b4a0eb8656664cf8d29f9fdab8c2
+WORKDIR /clients
+RUN git init -q \
+    && git fetch -q --depth 1 https://github.com/vaultwarden/vw_web_builds.git "${VW_WEB_BUILDS_COMMIT}" \
+    && git -c advice.detachedHead=false checkout -q FETCH_HEAD \
+    && npm ci
+COPY deploy/web-vault/patches /patches
+RUN git apply /patches/*.patch \
+    && cd apps/web \
+    && npm run dist:oss:selfhost \
+    && printf '{"version":"%s"}' 2026.8.0 > build/vw-version.json \
+    && mv build /web-vault
 
 FROM --platform=linux/amd64 ghcr.io/blackdex/rust-musl:x86_64-musl-stable-1.99.0 AS build
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]

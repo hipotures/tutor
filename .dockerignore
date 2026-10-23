@@ -15,3 +15,5 @@
 !Cargo.toml
 !rustfmt.toml
 !rust-toolchain.toml
+
+!deploy/web-vault/patches
